@@ -16,6 +16,7 @@ package build
 
 import (
 	"archive/tar"
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
@@ -31,6 +32,7 @@ import (
 	"strconv"
 	"strings"
 	"text/template"
+	"time"
 
 	"github.com/google/go-containerregistry/pkg/name"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
@@ -40,6 +42,7 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/types"
 	"github.com/google/ko/internal/sbom"
 	"github.com/google/ko/pkg/caps"
+	"github.com/google/ko/pkg/internal/git"
 	specsv1 "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/sigstore/cosign/v2/pkg/oci"
 	ocimutate "github.com/sigstore/cosign/v2/pkg/oci/mutate"
@@ -56,6 +59,12 @@ const (
 
 	defaultGoBin = "go"         // defaults to first go binary found in PATH
 	goBinPathEnv = "KO_GO_PATH" // env lookup for optional relative or full go binary path
+
+	envTemplateKey       = "Env"
+	goEnvTemplateKey     = "GoEnv"
+	gitTemplateKey       = "Git"
+	dateTemplateKey      = "Date"
+	timestampTemplateKey = "Timestamp"
 )
 
 // GetBase takes an importpath and returns a base image reference and base image (or index).
@@ -66,6 +75,7 @@ type buildContext struct {
 	ip       string
 	dir      string
 	env      []string
+	ldflags  []string
 	platform v1.Platform
 	config   Config
 }
@@ -91,6 +101,7 @@ type gobuild struct {
 	trimpath             bool
 	buildConfigs         map[string]Config
 	env                  []string
+	ldflags              []string
 	platformMatcher      *platformMatcher
 	dir                  string
 	labels               map[string]string
@@ -114,6 +125,7 @@ type gobuildOpener struct {
 	trimpath             bool
 	buildConfigs         map[string]Config
 	env                  []string
+	ldflags              []string
 	platforms            []string
 	labels               map[string]string
 	dir                  string
@@ -143,6 +155,7 @@ func (gbo *gobuildOpener) Open() (Interface, error) {
 		trimpath:             gbo.trimpath,
 		buildConfigs:         gbo.buildConfigs,
 		env:                  gbo.env,
+		ldflags:              gbo.ldflags,
 		labels:               gbo.labels,
 		dir:                  gbo.dir,
 		platformMatcher:      matcher,
@@ -264,7 +277,15 @@ func getGoBinary() string {
 }
 
 func build(ctx context.Context, buildCtx buildContext) (string, error) {
-	buildArgs, err := createBuildArgs(buildCtx.config)
+	// Merge the user and config environment variables.
+	mergedEnv, err := buildEnv(buildCtx.platform, os.Environ(), buildCtx.env, buildCtx.config.Env)
+	if err != nil {
+		return "", fmt.Errorf("could not create env for %s: %w", buildCtx.ip, err)
+	}
+
+	// Create the set of build arguments from the config flags/ldflags with any
+	// template parameters applied.
+	buildArgs, err := createBuildArgs(ctx, mergedEnv, buildCtx)
 	if err != nil {
 		return "", err
 	}
@@ -272,11 +293,6 @@ func build(ctx context.Context, buildCtx buildContext) (string, error) {
 	args := make([]string, 0, 4+len(buildArgs))
 	args = append(args, "build")
 	args = append(args, buildArgs...)
-
-	env, err := buildEnv(buildCtx.platform, os.Environ(), buildCtx.env, buildCtx.config.Env)
-	if err != nil {
-		return "", fmt.Errorf("could not create env for %s: %w", buildCtx.ip, err)
-	}
 
 	tmpDir := ""
 
@@ -313,7 +329,7 @@ func build(ctx context.Context, buildCtx buildContext) (string, error) {
 	gobin := getGoBinary()
 	cmd := exec.CommandContext(ctx, gobin, args...)
 	cmd.Dir = buildCtx.dir
-	cmd.Env = env
+	cmd.Env = mergedEnv
 
 	var output bytes.Buffer
 	cmd.Stderr = &output
@@ -322,11 +338,47 @@ func build(ctx context.Context, buildCtx buildContext) (string, error) {
 	log.Printf("Building %s for %s", buildCtx.ip, buildCtx.platform)
 	if err := cmd.Run(); err != nil {
 		if os.Getenv("KOCACHE") == "" {
-			os.RemoveAll(tmpDir)
+			_ = os.RemoveAll(tmpDir)
 		}
 		return "", fmt.Errorf("go build: %w: %s", err, output.String())
 	}
 	return file, nil
+}
+
+func goenv(ctx context.Context) (map[string]string, error) {
+	gobin := getGoBinary()
+	cmd := exec.CommandContext(ctx, gobin, "env")
+	var output bytes.Buffer
+	cmd.Stdout = &output
+	cmd.Stderr = &output
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("go env: %w: %s", err, output.String())
+	}
+
+	env := make(map[string]string)
+	scanner := bufio.NewScanner(bytes.NewReader(output.Bytes()))
+
+	line := 0
+	for scanner.Scan() {
+		line++
+		kv := strings.SplitN(scanner.Text(), "=", 2)
+		if len(kv) != 2 {
+			return nil, fmt.Errorf("go env: failed parsing line: %d", line)
+		}
+		key := strings.TrimSpace(kv[0])
+		value := strings.TrimSpace(kv[1])
+
+		// Unquote the value. Handle single or double quoted strings.
+		if len(value) > 1 && ((value[0] == '\'' && value[len(value)-1] == '\'') ||
+			(value[0] == '"' && value[len(value)-1] == '"')) {
+			value = value[1 : len(value)-1]
+		}
+		env[key] = value
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("go env: failed parsing: %w", err)
+	}
+	return env, nil
 }
 
 func goversionm(ctx context.Context, file string, appPath string, appFileName string, se oci.SignedEntity, dir string) ([]byte, types.MediaType, error) {
@@ -721,18 +773,45 @@ func (g *gobuild) tarKoData(ref reference, platform *v1.Platform) (*bytes.Buffer
 	return buf, walkRecursive(tw, root, chroot, creationTime, platform)
 }
 
-func createTemplateData() map[string]interface{} {
+func createTemplateData(ctx context.Context, dir string, mergedEnv []string) (map[string]interface{}, error) {
 	envVars := map[string]string{
 		"LDFLAGS": "",
 	}
-	for _, entry := range os.Environ() {
+	for _, entry := range mergedEnv {
 		kv := strings.SplitN(entry, "=", 2)
+		if len(kv) != 2 {
+			return nil, fmt.Errorf("invalid entry in os.Environ %q", entry)
+		}
 		envVars[kv[0]] = kv[1]
 	}
 
-	return map[string]interface{}{
-		"Env": envVars,
+	// Get the go environment.
+	goEnv, err := goenv(ctx)
+	if err != nil {
+		return nil, err
 	}
+
+	// Override go env with any matching values from the merged variables.
+	for k, v := range envVars {
+		if _, ok := goEnv[k]; ok {
+			goEnv[k] = v
+		}
+	}
+
+	// Get the git information, if available.
+	info, err := git.GetInfo(ctx, dir)
+	if err != nil {
+		log.Printf("%v", err)
+	}
+
+	date := time.Now()
+	return map[string]interface{}{
+		envTemplateKey:       envVars,
+		goEnvTemplateKey:     goEnv,
+		gitTemplateKey:       info.TemplateValue(),
+		dateTemplateKey:      date.Format(time.RFC3339),
+		timestampTemplateKey: date.UTC().Unix(),
+	}, nil
 }
 
 func applyTemplating(list []string, data map[string]interface{}) ([]string, error) {
@@ -754,13 +833,16 @@ func applyTemplating(list []string, data map[string]interface{}) ([]string, erro
 	return result, nil
 }
 
-func createBuildArgs(buildCfg Config) ([]string, error) {
+func createBuildArgs(ctx context.Context, mergedEnv []string, buildCtx buildContext) ([]string, error) {
 	var args []string
 
-	data := createTemplateData()
+	data, err := createTemplateData(ctx, buildCtx.dir, mergedEnv)
+	if err != nil {
+		return nil, err
+	}
 
-	if len(buildCfg.Flags) > 0 {
-		flags, err := applyTemplating(buildCfg.Flags, data)
+	if len(buildCtx.config.Flags) > 0 {
+		flags, err := applyTemplating(buildCtx.config.Flags, data)
 		if err != nil {
 			return nil, err
 		}
@@ -768,8 +850,10 @@ func createBuildArgs(buildCfg Config) ([]string, error) {
 		args = append(args, flags...)
 	}
 
-	if len(buildCfg.Ldflags) > 0 {
-		ldflags, err := applyTemplating(buildCfg.Ldflags, data)
+	// Merge the global and build ldflags.
+	ldflags := append(append([]string{}, buildCtx.ldflags...), buildCtx.config.Ldflags...)
+	if len(ldflags) > 0 {
+		ldflags, err = applyTemplating(ldflags, data)
 		if err != nil {
 			return nil, err
 		}
@@ -853,6 +937,7 @@ func (g *gobuild) buildOne(ctx context.Context, refStr string, base v1.Image, pl
 		ip:       ref.Path(),
 		dir:      g.dir,
 		env:      g.env,
+		ldflags:  g.ldflags,
 		platform: *platform,
 		config:   config,
 	})
@@ -1082,7 +1167,7 @@ func (g *gobuild) buildAll(ctx context.Context, ref string, baseRef name.Referen
 		return nil, err
 	}
 
-	matches := []v1.Descriptor{}
+	var matches []v1.Descriptor
 	for _, desc := range im.Manifests {
 		// Nested index is pretty rare. We could support this in theory, but return an error for now.
 		if desc.MediaType != types.OCIManifestSchema1 && desc.MediaType != types.DockerManifestSchema2 {
@@ -1207,7 +1292,7 @@ func parseSpec(spec []string) (*platformMatcher, error) {
 		return &platformMatcher{spec: spec}, nil
 	}
 
-	platforms := []v1.Platform{}
+	var platforms []v1.Platform
 	for _, s := range spec {
 		p, err := v1.ParsePlatform(s)
 		if err != nil {

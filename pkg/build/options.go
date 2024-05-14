@@ -94,6 +94,15 @@ func WithEnv(env []string) Option {
 	}
 }
 
+// WithLDFlags is a functional option for providing a global set of ldflags
+// across all builds.
+func WithLDFlags(ldflags []string) Option {
+	return func(gbo *gobuildOpener) error {
+		gbo.ldflags = ldflags
+		return nil
+	}
+}
+
 // WithPlatforms is a functional option for building certain platforms for
 // multi-platform base images. To build everything from the base, use "all",
 // otherwise use a list of platform specs, i.e.:

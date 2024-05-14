@@ -87,6 +87,7 @@ func gobuildOptions(bo *options.BuildOptions) ([]build.Option, error) {
 	opts := []build.Option{
 		build.WithBaseImages(getBaseImage(bo)),
 		build.WithEnv(bo.Env),
+		build.WithLDFlags(bo.LDFlags),
 		build.WithPlatforms(bo.Platforms...),
 		build.WithJobs(bo.ConcurrentBuilds),
 	}
