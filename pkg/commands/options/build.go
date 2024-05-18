@@ -20,14 +20,14 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 
 	"github.com/google/go-containerregistry/pkg/name"
+	"github.com/google/ko/pkg/build"
 	"github.com/mitchellh/mapstructure"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 	"golang.org/x/tools/go/packages"
-
-	"github.com/google/ko/pkg/build"
 )
 
 const (
@@ -111,6 +111,9 @@ func (bo *BuildOptions) LoadConfig() error {
 	v.SetConfigName(configName) // .yaml is implicit
 	v.SetEnvPrefix("KO")
 	v.AutomaticEnv()
+
+	// Hack for knative to fix https://github.com/ko-build/ko/issues/1317.
+	v.SetEnvKeyReplacer(strings.NewReplacer("KO_FLAGS", "KO_BUILD_FLAGS"))
 
 	if override := os.Getenv("KO_CONFIG_PATH"); override != "" {
 		file, err := os.Stat(override)
